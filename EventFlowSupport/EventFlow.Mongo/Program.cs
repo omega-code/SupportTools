@@ -1,81 +1,109 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using MoreLinq;
 
 namespace EventFlow.Mongo
 {
-	class Program
+	partial class Program
 	{
 		static void Main(string[] args)
 		{
 			// connect mongo
 			var client = new MongoClient(
 				"mongodb://blumenkraft:vdNDU8F4LxJTsjGJ@iceis.blumenkraft.me:27017"
+				//"mongodb://localhost:27017"
 			);
-			var database = client.GetDatabase("IceIS-Prod-01");
+			var database = client.GetDatabase("IceIS-Prod-01");		
+		
+			//DeleteTailEventsWithWrongSequenceNumber(database);
 			
+//			GenerateMapAutoCats(database, "Tool");
+//			GenerateMapAutoCats(database, "Supply");
 			
-			// load all events
+//			RenderEnsuringCommandsSourceAndToolIds(database, "Tool", ToolsMap());
+//			RenderEnsuringCommandsSourceAndToolIds(database, "Supply", SuppliesMap());
+//
+			PatchEvents(database, "Tool", ToolsMap(), "toolsku-22c8ea4a-d3e6-42a6-ae6b-e93866b6cd8e");
+			PatchEvents(database, "Supply", SuppliesMap(), "supplysku-3e847eb7-fbdc-4dab-aeb3-0d316086d58b");
+		}
+
+		private static void PatchEvents(IMongoDatabase database, string type, Dictionary<string, string> catToSkuMap,
+			string defaultSkuId)
+		{
 			var collection = database.GetCollection<BsonDocument>("eventflow.events");
 			var events = collection.Find(new BsonDocument()).ToList();
-		
-			// group by agg id
-			var aggregates = events
-				.GroupBy(e => e["AggregateId"])
-				.Select(g => new
+
+			var adjustments = events.Where(e => e["Data"].AsString.Contains($"{type}ClaimAdjustmentUpdated")).ToArray();
+			var claims = events.Where(e => e["Data"].AsString.Contains($"{type}ClaimUpdated")).ToArray();
+
+			string FixAdjustmentData(string data)
+			{
+				var claimRegex = new Regex(
+					$@"""Adjustment"":{{""Category"":""(?<cat>{type.ToLowerInvariant()}category-[-\w\d]+)"""
+				);
+
+				return claimRegex.Replace(data, m => $@"""Adjustment"":{{""SkuId"":""{SkuFor(m.Groups["cat"].Value)}""");
+			}
+			
+			
+			string FixClaimData(string data)
+			{
+				var claimRegex = new Regex(
+					$@"""Claim"":{{""Category"":""(?<cat>{type.ToLowerInvariant()}category-[-\w\d]+)"""
+				);
+
+				return claimRegex.Replace(data, m => $@"""Claim"":{{""RequestedSku"":""{SkuFor(m.Groups["cat"].Value)}""");
+			}
+
+			string SkuFor(string catId)
+			{
+				if (catToSkuMap.ContainsKey(catId))
+					return catToSkuMap[catId];
+				else
 				{
-					AggregateId = g.Key, 
-					Events = g.ToArray()
-				})
-				.Select(a => new
-					{
-						a.AggregateId, 
-						Events = a.Events
-							.GroupBy(e => e["AggregateSequenceNumber"])
-							.Select(g => new
-							{
-								AggregateSequenceNumber = g.Key, 
-								Events = g.ToArray()
-							})
-							.ToArray()
-					}
-				)
-				.Select(a => new
-					{
-						a.AggregateId, 
-						a.Events,
-						BadEvents = a.Events
-							.Where(e => e.Events.Length > 1)
-							.SelectMany(e => e.Events.Skip(1))
-							.ToArray()
-					}
-				)
-				.ToArray();
+					Console.WriteLine("No sku for " + catId);
+					return defaultSkuId;
+				}
+			}
 
-			var badAggregates = aggregates
-				.Where(a => a.BadEvents.Any())
-				.ToArray();
-			
-			Console.WriteLine($"Bad: {badAggregates.Length}");
+			foreach (var e in adjustments)
+			{
+//				Console.WriteLine();
+//				Console.WriteLine(e["Data"].AsString);
+//				Console.WriteLine("→");
+//				Console.WriteLine(FixAdjustmentData(e["Data"].AsString));
 
-			badAggregates.ForEach(a => Console.WriteLine($"{a.AggregateId}: {a.BadEvents.Length}"));
+				var filterDefinition = new BsonDocument("_id", e["_id"].AsInt64);
 
-			var badEvents = badAggregates.SelectMany(b => b.BadEvents).ToArray();
-			badEvents.ForEach(Console.WriteLine);
-			Console.WriteLine("Плохих событий:");
-			Console.WriteLine(badEvents.Length);
+				var res = e.Set("Data", FixAdjustmentData(e["Data"].AsString));
+				
+				Console.WriteLine(collection.ReplaceOne(
+					filterDefinition, res
+				).ModifiedCount);
+				
+			}
 
-			//  delete extra
-			badEvents
-				.Select(be => be["_id"])
-				.Select(id => Builders<BsonDocument>.Filter.Eq("_id", id))
-				.ForEach(f => collection.DeleteOne(f));
-			
-			// repeat again check no logging
-			
-			//Console.WriteLine(aggregates.Length);
+			foreach (var e in claims)
+			{
+//				Console.WriteLine();
+//				Console.WriteLine(e["Data"].AsString);
+//				Console.WriteLine("→");
+//				Console.WriteLine(FixClaimData(e["Data"].AsString));
+
+				var filterDefinition = new BsonDocument("_id", e["_id"].AsInt64);
+				
+				var res = e.Set("Data", FixClaimData(e["Data"].AsString));
+				
+				Console.WriteLine(collection.ReplaceOne(
+					filterDefinition, res
+				).ModifiedCount);
+
+			}
 		}
 	}
 }
